@@ -4,7 +4,10 @@ The intune collector collects metrics and status about managed devices.
 
 ## Configuration
 
-None
+| Key                                | Type     | Default | Description                                                                 |
+|------------------------------------|----------|---------|-----------------------------------------------------------------------------|
+| `intune.perPolicyCompliance`       | `bool`   | `false` | Enable per-device, per-policy compliance metrics (opt-in due to high cardinality) |
+| `intune.perPolicyComplianceFilter` | `[]string` | `[]`  | Glob patterns to filter policies by name (empty = all policies). Case-insensitive, OR logic. |
 
 ## Metrics
 
@@ -16,6 +19,7 @@ None
 | `m365_intune_vpp_expiry`        | Expiration timestamp of Apple VPP tokens in Unix timestamp                                        | Gauge | `tenant`, `appleId`, `organizationName`, `id` |
 | `m365_intune_dep_token_expiry`  | Expiration timestamp of Apple DEP onboarding tokens in Unix timestamp                             | Gauge | `tenant`, `appleId`, `id`              |
 | `m365_intune_apn_expiry`        | Expiration timestamp of Apple Push Notification Certificate in Unix timestamp                      | Gauge | `tenant`, `appleId`, `topicIdentifier`, `id` |
+| `m365_intune_device_policy_compliance` | Per-device, per-policy compliance status (info-style gauge, always 1). Opt-in via `intune.perPolicyCompliance: true`. | Gauge | `tenant`, `policy_name`, `device_name`, `compliance_status` |
 
 ## Example metric
 
@@ -62,8 +66,30 @@ m365_intune_dep_token_expiry{appleId="example@company.appleid.com",id="0000000-0
 m365_intune_apn_expiry{appleId="example@company.appleid.com",topicIdentifier="com.apple.mgmt.External.example-uuid",id="0000000-0000-0000-0000-000000000000",tenant="0000000-0000-0000-0000-000000000000"} 1.782552802e+09
 ```
 
+### Per-policy compliance (opt-in)
+
+When `intune.perPolicyCompliance: true` is set:
+
+```
+# HELP m365_intune_device_policy_compliance Per-device, per-policy compliance status (info-style gauge, always 1)
+# TYPE m365_intune_device_policy_compliance gauge
+m365_intune_device_policy_compliance{compliance_status="compliant",device_name="DESKTOP-ABC123",policy_name="Windows Compliance Policy",tenant="0000000-0000-0000-0000-000000000000"} 1
+m365_intune_device_policy_compliance{compliance_status="nonCompliant",device_name="LAPTOP-XYZ789",policy_name="Windows Compliance Policy",tenant="0000000-0000-0000-0000-000000000000"} 1
+```
+
 ## Useful queries
-__This collector does not yet have any useful queries added, we would appreciate your help adding them!__
+
+```promql
+# Non-compliant devices per policy
+count by (policy_name) (m365_intune_device_policy_compliance{compliance_status="nonCompliant"})
+
+# All statuses for a specific policy
+count by (compliance_status) (m365_intune_device_policy_compliance{policy_name="Windows Compliance Policy"})
+```
 
 ## Alerting examples
-__This collector does not yet have alerting examples, we would appreciate your help adding them!__
+
+```promql
+# Alert: any device non-compliant
+count(m365_intune_device_policy_compliance{compliance_status="nonCompliant"}) > 0
+```

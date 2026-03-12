@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path"
 	"slices"
 	"strings"
 	"time"
@@ -34,6 +35,9 @@ const (
 
 	// URLDepOnboardingSettings DEP Onboarding Settings API URL
 	URLDepOnboardingSettings = "https://graph.microsoft.com/beta/deviceManagement/depOnboardingSettings"
+
+	// URLDeviceCompliancePolicies Device Compliance Policies API URL
+	URLDeviceCompliancePolicies = "https://graph.microsoft.com/beta/deviceManagement/deviceCompliancePolicies"
 )
 
 // Interface guard.
@@ -52,22 +56,57 @@ type depOnboardingSettingsResponse struct {
 	Value []depOnboardingSetting `json:"value"`
 }
 
+// Settings holds configuration for the Intune collector.
+type Settings struct {
+	PerPolicyCompliance       bool
+	PerPolicyComplianceFilter []string
+}
+
+type compliancePolicy struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"displayName"`
+}
+
+type compliancePolicyListResponse struct {
+	Value    []compliancePolicy `json:"value"`
+	NextLink string             `json:"@odata.nextLink"`
+}
+
+type deviceComplianceStatus struct {
+	DeviceDisplayName string `json:"deviceDisplayName"`
+	Status            string `json:"status"`
+}
+
+type deviceComplianceStatusListResponse struct {
+	Value    []deviceComplianceStatus `json:"value"`
+	NextLink string                   `json:"@odata.nextLink"`
+}
+
 type Collector struct {
 	abstract.BaseCollector
 
 	logger *slog.Logger
 
-	complianceDesc *prometheus.Desc
-	osDesc         *prometheus.Desc
-	vppStatusDesc  *prometheus.Desc
-	vppExpiryDesc  *prometheus.Desc
-	depExpiryDesc  *prometheus.Desc
-	apnExpiryDesc  *prometheus.Desc
+	complianceDesc          *prometheus.Desc
+	osDesc                  *prometheus.Desc
+	vppStatusDesc           *prometheus.Desc
+	vppExpiryDesc           *prometheus.Desc
+	depExpiryDesc           *prometheus.Desc
+	apnExpiryDesc           *prometheus.Desc
+	perPolicyComplianceDesc *prometheus.Desc
 
-	httpClient *http.Client
+	httpClient       *http.Client
+	perPolicyEnabled bool
+	policyFilter     []string
 }
 
-func NewCollector(logger *slog.Logger, tenant string, msGraphClient *msgraphsdk.GraphServiceClient, httpClient *http.Client) *Collector {
+func NewCollector(
+	logger *slog.Logger,
+	tenant string,
+	msGraphClient *msgraphsdk.GraphServiceClient,
+	httpClient *http.Client,
+	settings Settings,
+) *Collector {
 	return &Collector{
 		BaseCollector: abstract.NewBaseCollector(msGraphClient, subsystem),
 		logger:        logger.With(slog.String("collector", subsystem)),
@@ -120,8 +159,18 @@ func NewCollector(logger *slog.Logger, tenant string, msGraphClient *msgraphsdk.
 				"tenant": tenant,
 			},
 		),
+		perPolicyComplianceDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(abstract.Namespace, subsystem, "device_policy_compliance"),
+			"Per-device, per-policy compliance status (info-style gauge, always 1)",
+			[]string{"policy_name", "device_name", "compliance_status"},
+			prometheus.Labels{
+				"tenant": tenant,
+			},
+		),
 
-		httpClient: httpClient,
+		httpClient:       httpClient,
+		perPolicyEnabled: settings.PerPolicyCompliance,
+		policyFilter:     toLowerSlice(settings.PerPolicyComplianceFilter),
 	}
 }
 
@@ -143,6 +192,10 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.depExpiryDesc
 
 	ch <- c.apnExpiryDesc
+
+	if c.perPolicyEnabled {
+		ch <- c.perPolicyComplianceDesc
+	}
 }
 
 func (c *Collector) ScrapeMetrics(ctx context.Context) ([]prometheus.Metric, error) {
@@ -173,7 +226,16 @@ func (c *Collector) ScrapeMetrics(ctx context.Context) ([]prometheus.Metric, err
 		errs = append(errs, fmt.Errorf("error scraping apple push notification certificate metrics: %w", err))
 	}
 
-	return slices.Concat(complianceMetrics, osMetrics, vppMetrics, depMetrics, apnMetrics), errors.Join(errs...)
+	var perPolicyMetrics []prometheus.Metric
+
+	if c.perPolicyEnabled {
+		perPolicyMetrics, err = c.scrapePerPolicyCompliance(ctx)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error scraping per-policy compliance metrics: %w", err))
+		}
+	}
+
+	return slices.Concat(complianceMetrics, osMetrics, vppMetrics, depMetrics, apnMetrics, perPolicyMetrics), errors.Join(errs...)
 }
 
 func (c *Collector) scrapeCompliance(ctx context.Context) ([]prometheus.Metric, error) {
@@ -380,37 +442,11 @@ func (c *Collector) scrapeVppTokens(ctx context.Context) ([]prometheus.Metric, e
 }
 
 func (c *Collector) scrapeDepOnboardingSettings(ctx context.Context) ([]prometheus.Metric, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, URLDepOnboardingSettings, nil)
-	if err != nil {
-		return nil, fmt.Errorf("error creating request: %w", err)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("error sending request: %w", err)
-	}
-
-	defer func() {
-		err := resp.Body.Close()
-		if err != nil {
-			c.logger.ErrorContext(ctx, "error closing response body", slog.Any("err", err))
-		}
-	}()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("error reading response body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
-	}
-
 	var depResponse depOnboardingSettingsResponse
 
-	err = json.Unmarshal(body, &depResponse)
+	err := c.getJSON(ctx, URLDepOnboardingSettings, &depResponse)
 	if err != nil {
-		return nil, fmt.Errorf("error unmarshalling response: body %s, error %w", string(body), err)
+		return nil, fmt.Errorf("error fetching DEP onboarding settings: %w", err)
 	}
 
 	metrics := make([]prometheus.Metric, 0, len(depResponse.Value))
@@ -484,4 +520,175 @@ func (c *Collector) scrapeApplePushNotificationCertificate(ctx context.Context) 
 	metrics = append(metrics, metric)
 
 	return metrics, nil
+}
+
+func (c *Collector) getJSON(ctx context.Context, url string, target any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("error creating request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("error sending request: %w", err)
+	}
+
+	defer func() {
+		err := resp.Body.Close()
+		if err != nil {
+			c.logger.ErrorContext(ctx, "error closing response body", slog.Any("err", err))
+		}
+	}()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("error reading response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
+	}
+
+	err = json.Unmarshal(body, target)
+	if err != nil {
+		return fmt.Errorf("error unmarshalling response: body %s, error %w", string(body), err)
+	}
+
+	return nil
+}
+
+func (c *Collector) fetchAllCompliancePolicies(ctx context.Context) ([]compliancePolicy, error) {
+	var all []compliancePolicy
+
+	url := URLDeviceCompliancePolicies + "?$select=id,displayName"
+
+	for url != "" {
+		var resp compliancePolicyListResponse
+
+		err := c.getJSON(ctx, url, &resp)
+		if err != nil {
+			return nil, fmt.Errorf("error fetching compliance policies: %w", err)
+		}
+
+		all = append(all, resp.Value...)
+		url = resp.NextLink
+	}
+
+	return all, nil
+}
+
+func (c *Collector) fetchPolicyDeviceStatuses(ctx context.Context, policyID string) ([]deviceComplianceStatus, error) {
+	var all []deviceComplianceStatus
+
+	url := URLDeviceCompliancePolicies + "/" + policyID + "/deviceStatuses?$select=deviceDisplayName,status"
+
+	for url != "" {
+		var resp deviceComplianceStatusListResponse
+
+		err := c.getJSON(ctx, url, &resp)
+		if err != nil {
+			return nil, fmt.Errorf("error fetching device statuses for policy %s: %w", policyID, err)
+		}
+
+		all = append(all, resp.Value...)
+		url = resp.NextLink
+	}
+
+	return all, nil
+}
+
+func (c *Collector) scrapePerPolicyCompliance(ctx context.Context) ([]prometheus.Metric, error) {
+	policies, err := c.fetchAllCompliancePolicies(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("error fetching compliance policies: %w", err)
+	}
+
+	var metrics []prometheus.Metric
+
+	for _, policy := range policies {
+		policyName := policy.DisplayName
+
+		if policyName == "" {
+			policyName = unknownValue
+		}
+
+		if !c.matchesPolicyFilter(policyName) {
+			continue
+		}
+
+		statuses, err := c.fetchPolicyDeviceStatuses(ctx, policy.ID)
+		if err != nil {
+			c.logger.ErrorContext(ctx, "error fetching device statuses for policy, skipping",
+				slog.String("policy_name", policyName),
+				slog.String("policy_id", policy.ID),
+				slog.Any("err", err),
+			)
+
+			continue
+		}
+
+		for _, ds := range statuses {
+			deviceName := ds.DeviceDisplayName
+
+			if deviceName == "" {
+				deviceName = unknownValue
+			}
+
+			status := ds.Status
+
+			if status == "" {
+				status = unknownValue
+			}
+
+			metrics = append(metrics, prometheus.MustNewConstMetric(
+				c.perPolicyComplianceDesc,
+				prometheus.GaugeValue,
+				1.0,
+				policyName, deviceName, status,
+			))
+		}
+	}
+
+	c.logger.InfoContext(ctx, "scraped per-policy compliance metrics",
+		slog.Int("policies", len(policies)),
+		slog.Int("metrics", len(metrics)),
+	)
+
+	return metrics, nil
+}
+
+func (c *Collector) matchesPolicyFilter(policyName string) bool {
+	if len(c.policyFilter) == 0 {
+		return true
+	}
+
+	lowerName := strings.ToLower(policyName)
+
+	for _, pattern := range c.policyFilter {
+		matched, err := path.Match(pattern, lowerName)
+		if err != nil {
+			c.logger.Warn("invalid glob pattern in policy filter, skipping",
+				slog.String("pattern", pattern),
+				slog.Any("err", err),
+			)
+
+			continue
+		}
+
+		if matched {
+			return true
+		}
+	}
+
+	return false
+}
+
+func toLowerSlice(ss []string) []string {
+	out := make([]string, len(ss))
+
+	for i, s := range ss {
+		out[i] = strings.ToLower(s)
+	}
+
+	return out
 }
